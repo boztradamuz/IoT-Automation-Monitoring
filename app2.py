@@ -1,30 +1,33 @@
-import RPi.GPIO as GPIO
-import time
+#!/usr/bin/env python
+
+# Copyright (c) Microsoft. All rights reserved.
+# Licensed under the MIT license. See LICENSE file in the project root for
+# full license information.
+
 import random
+import time
 import sys
 from iothub_client import IoTHubClient, IoTHubClientError, IoTHubTransportProvider, IoTHubClientResult
 from iothub_client import IoTHubMessage, IoTHubMessageDispositionResult, IoTHubError, DeviceMethodReturnValue
+import config as config
+from BME280SensorSimulator import BME280SensorSimulator
+import RPi.GPIO as GPIO
+from Adafruit_BME280 import *
 import re
 from telemetry import Telemetry
 
-#SETUP ZONE--------------------------------------
-GPIO.setmode(GPIO.BCM)
-#GPIO.setwarnings(False)
-#MotionSensor Pin
-PIR_PIN = 7
-GPIO.setup(PIR_PIN, GPIO.IN)
-
-#Relay Pin
-RELAY_PIN=18
-GPIO.setup(RELAY_PIN, GPIO.OUT)
-#-------------------------------------------------
-
-#ON/OFF STATE
-state=0
-
-#Value
+# HTTP options
+# Because it can poll "after 9 seconds" polls will happen effectively
+# at ~10 seconds.
+# Note that for scalabilty, the default value of minimumPollingTime
+# is 25 minutes. For more information, see:
+# https://azure.microsoft.com/documentation/articles/iot-hub-devguide/#messaging
 TIMEOUT = 241000
 MINIMUM_POLLING_TIME = 9
+
+# messageTimeout - the maximum time in milliseconds until a message times out.
+# The timeout period starts at IoTHubClient.send_event_async.
+# By default, messages do not expire.
 MESSAGE_TIMEOUT = 10000
 
 RECEIVE_CONTEXT = 0
@@ -52,6 +55,17 @@ PROTOCOL = IoTHubTransportProvider.MQTT
 # "HostName=<host_name>;DeviceId=<device_id>;SharedAccessKey=<device_key>"
 telemetry = Telemetry()
 
+GPIO.setmode(GPIO.BCM)
+#MotionSensor Pin
+PIR_PIN = 7
+GPIO.setup(PIR_PIN, GPIO.IN)
+
+#Relay Pin
+RELAY_PIN=18
+GPIO.setup(RELAY_PIN, GPIO.OUT)
+
+
+
 if len(sys.argv) < 2:
     print ( "You need to provide the device connection string as command line arguments." )
     telemetry.send_telemetry_data(None, EVENT_FAILED, "Device connection string is not provided")
@@ -70,10 +84,13 @@ if not is_correct_connection_string():
     print ( "Device connection string is not correct." )
     telemetry.send_telemetry_data(None, EVENT_FAILED, "Device connection string is not correct.")
     sys.exit(0)
-    
-MSG_TXT = "{\"deviceId\": \"Raspberry Pi - Python\",\"temperature\": %f,\"humidity\": %f}"
 
-#def ZONE -----------------------------------------------
+#MSG_TXT = "{\"Device\": \"Light01\",\"ON\": %f,\"OFF\": %f}"
+MSG_TXT = "{\"Device\": \"Light01\",\"Status\": %f}"
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(config.GPIO_PIN_ADDRESS, GPIO.OUT)
+
 def receive_message_callback(message, counter):
     global RECEIVE_CALLBACKS
     message_buffer = message.get_bytearray()
@@ -175,7 +192,69 @@ def print_last_message_time(client):
             print ( "No message received" )
         else:
             print ( iothub_client_error )
-            
+
+
+def iothub_client_sample_run():
+    try:
+        client = iothub_client_init()
+
+        if client.protocol == IoTHubTransportProvider.MQTT:
+            print ( "IoTHubClient is reporting state" )
+            reported_state = "{\"newState\":\"standBy\"}"
+            client.send_reported_state(reported_state, len(reported_state), send_reported_state_callback, SEND_REPORTED_STATE_CONTEXT)
+
+        if not config.SIMULATED_DATA:        
+            sensor = BME280(address = config.I2C_ADDRESS)
+        else:
+            sensor = BME280SensorSimulator()
+
+        telemetry.send_telemetry_data(parse_iot_hub_name(), EVENT_SUCCESS, "IoT hub connection is established")
+        while True:
+            global MESSAGE_COUNT,MESSAGE_SWITCH
+            if MESSAGE_SWITCH:
+                # send a few messages every minute
+                print ( "IoTHubClient sending %d messages" % MESSAGE_COUNT )
+                #---------------------------------------
+                global state
+                state=0
+                if GPIO.input(PIR_PIN):
+                    if state==0:
+                        GPIO.output(RELAY_PIN,GPIO.HIGH)
+                        state=1
+                    else:
+                        GPIO.output(RELAY_PIN,GPIO.LOW)
+                        state=0
+                time.sleep(3)
+                    
+                
+                #---------------------------------------
+                msg_txt_formatted = MSG_TXT % (state)
+                print (msg_txt_formatted)
+                message = IoTHubMessage(msg_txt_formatted)
+                # optional: assign ids
+                message.message_id = "message_%d" % MESSAGE_COUNT
+                message.correlation_id = "correlation_%d" % MESSAGE_COUNT
+                # optional: assign properties
+                prop_map = message.properties()
+                #prop_map.add("temperatureAlert", "true" if temperature > TEMPERATURE_ALERT else "false")
+
+                client.send_event_async(message, send_confirmation_callback, MESSAGE_COUNT)
+                print ( "IoTHubClient.send_event_async accepted message [%d] for transmission to IoT Hub." % MESSAGE_COUNT )
+
+                status = client.get_send_status()
+                print ( "Send status: %s" % status )
+                MESSAGE_COUNT += 1
+            time.sleep(2)
+
+    except IoTHubError as iothub_error:
+        print ( "Unexpected error %s from IoTHub" % iothub_error )
+        telemetry.send_telemetry_data(parse_iot_hub_name(), EVENT_FAILED, "Unexpected error %s from IoTHub" % iothub_error)
+        return
+    except KeyboardInterrupt:
+        print ( "IoTHubClient sample stopped" )
+
+    print_last_message_time(client)
+
 def led_blink():
     GPIO.output(config.GPIO_PIN_ADDRESS, GPIO.HIGH)
     time.sleep(config.BLINK_TIMESPAN / 1000.0)
@@ -194,107 +273,4 @@ if __name__ == "__main__":
     print ( "\nPython %s" % sys.version )
     print ( "IoT Hub Client for Python" )
 
-#------------------------------------------------------------------------
-
-######################## MAIN PROGRAM ###########################
-def iothub_client_sample_run():
-    try:
-        client = iothub_client_init()
-
-        if client.protocol == IoTHubTransportProvider.MQTT:
-            print ( "IoTHubClient is reporting state" )
-            reported_state = "{\"newState\":\"standBy\"}"
-            client.send_reported_state(reported_state, len(reported_state), send_reported_state_callback, SEND_REPORTED_STATE_CONTEXT)
-
-        #if not config.SIMULATED_DATA:        
-        #    sensor = BME280(address = config.I2C_ADDRESS)
-        #else:
-        #    sensor = BME280SensorSimulator()
-
-        telemetry.send_telemetry_data(parse_iot_hub_name(), EVENT_SUCCESS, "IoT hub connection is established")
-        while True:
-            global MESSAGE_COUNT,MESSAGE_SWITCH
-            if GPIO.input(PIR_PIN):
-                print ("Motion Detected!")
-                if state==0:
-                    state=1
-                    GPIO.output(RELAY_PIN,GPIO.HIGH)
-                    #print(">>>>>>>>>>>>>>> State:",state,"Welcome!")
-                else:
-                    state=0
-                    GPIO.output(RELAY_PIN,GPIO.LOW)
-                    #print(">>>>>>>>>>>>>>>> State:",state,"Goodbye!")
-                    
-            #if MESSAGE_SWITCH:
-                # send a few messages every minute
-                print ( "IoTHubClient sending %d messages" % MESSAGE_COUNT )
-                #temperature = sensor.read_temperature()
-                #humidity = sensor.read_humidity()
-                #msg_txt_formatted = MSG_TXT % (
-                    #temperature,
-                    #humidity)
-                #print (msg_txt_formatted)
-                print(state)
-                #FIX THIS#######message = IoTHubMessage(msg_txt_formatted)
-                message=IoTHubMessage(state)
-                # optional: assign ids
-                message.message_id = "message_%d" % MESSAGE_COUNT
-                message.correlation_id = "correlation_%d" % MESSAGE_COUNT
-                # optional: assign properties
-                prop_map = message.properties()
-                prop_map.add("temperatureAlert", "true" if temperature > TEMPERATURE_ALERT else "false")
-
-                client.send_event_async(message, send_confirmation_callback, MESSAGE_COUNT)
-                print ( "IoTHubClient.send_event_async accepted message [%d] for transmission to IoT Hub." % MESSAGE_COUNT )
-
-                status = client.get_send_status()
-                print ( "Send status: %s" % status )
-                MESSAGE_COUNT += 1
-            time.sleep(3)
-
-    except IoTHubError as iothub_error:
-        print ( "Unexpected error %s from IoTHub" % iothub_error )
-        telemetry.send_telemetry_data(parse_iot_hub_name(), EVENT_FAILED, "Unexpected error %s from IoTHub" % iothub_error)
-        return
-    except KeyboardInterrupt:
-        print ( "IoTHubClient sample stopped" )
-
-    print_last_message_time(client)
     iothub_client_sample_run()
-'''    
-try:
-               print("Module Test (CTRL+C to exit)")
-               print("Auto Light Switch with motion sensor)
-               
-               time.sleep(2)
-               print("Ready")
-               while True:
-                             if GPIO.input(PIR_PIN):
-                                             print ("Motion Detected!")
-                                             if state==0:
-                                                 state=1
-                                                 GPIO.output(RELAY_PIN,GPIO.HIGH)
-                                                 print(">>>>>>>>>>>>>>> State:",state,"Welcome!")
-                                             else:
-                                                state=0
-                                                GPIO.output(RELAY_PIN,GPIO.LOW)
-                                                print(">>>>>>>>>>>>>>>> State:",state,"Goodbye!")
-                            
-                             print ("Settle down")             
-                             #time.sleep(1)
-                             #print("5")
-                             #time.sleep(1)
-                             #print("4")
-                             time.sleep(1)
-                             print("3")
-                             time.sleep(1)
-                             print("2")
-                             time.sleep(1)
-                             print("1")
-                             
-                             
-                                             
-except KeyboardInterrupt:
-               print (" Quit ")
-               GPIO.cleanup()
-'''
